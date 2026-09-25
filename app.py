@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import streamlit as st
 
-from src.network_intrusion_detection.pipeline import load_or_create_demo_dataset, prepare_training_data, train_model
+from src.network_intrusion_detection.pipeline import find_real_dataset_path, load_or_create_demo_dataset, prepare_training_data, train_model
 
 
 st.set_page_config(page_title="Network Security Analyzer", page_icon="🛡️", layout="wide")
@@ -10,7 +12,13 @@ st.set_page_config(page_title="Network Security Analyzer", page_icon="🛡️", 
 st.title("🛡️ Network Security Analyzer")
 st.caption("A simple machine-learning demo for detecting suspicious network traffic.")
 
-raw_df = load_or_create_demo_dataset(n_rows=2000)
+real_dataset = find_real_dataset_path()
+if real_dataset is not None:
+    st.info(f"Using real dataset: {real_dataset.name}")
+else:
+    st.info("No local UNSW-NB15 CSV detected. Using the built-in demo data generator.")
+
+raw_df = load_or_create_demo_dataset(n_rows=2000, dataset_path=real_dataset)
 X, y = prepare_training_data(raw_df)
 model = train_model(X, y)
 

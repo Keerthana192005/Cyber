@@ -10,12 +10,57 @@ from sklearn.model_selection import train_test_split
 
 
 DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "demo_network_traffic.csv"
+UNSW_DATASET_CANDIDATES = [
+    Path(__file__).resolve().parents[2] / "data" / "UNSW_NB15_training-set.csv",
+    Path(__file__).resolve().parents[2] / "data" / "UNSW_NB15.csv",
+    Path(__file__).resolve().parents[2] / "UNSW_NB15_training-set.csv",
+    Path(__file__).resolve().parents[2] / "UNSW_NB15.csv",
+]
 
 
-def load_or_create_demo_dataset(n_rows: int = 2000) -> pd.DataFrame:
-    """Create or load a small demo dataset representing network traffic."""
-    if DATASET_PATH.exists():
-        return pd.read_csv(DATASET_PATH)
+def _normalize_feature_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize columns commonly seen in UNSW-NB15 or similar traffic datasets."""
+    renamed_columns = {
+        "attack_cat": "attack_cat",
+        "Label": "label",
+        "label": "label",
+        "dur": "dur",
+        "proto": "proto",
+        "service": "service",
+        "state": "state",
+        "spkts": "spkts",
+        "dpkts": "dpkts",
+        "sbytes": "sbytes",
+        "dbytes": "dbytes",
+        "sttl": "sttl",
+        "dttl": "dttl",
+        "rate": "rate",
+        "srcip": "srcip",
+        "dstip": "dstip",
+        "sport": "sport",
+        "dsport": "dsport",
+    }
+    df = df.rename(columns={k: v for k, v in renamed_columns.items() if k in df.columns})
+    if "label" in df.columns:
+        df["label"] = df["label"].astype(str).str.strip().str.lower()
+    return df
+
+
+def find_real_dataset_path() -> Path | None:
+    """Return a real UNSW-NB15 dataset path if it exists in the project directory."""
+    for candidate in UNSW_DATASET_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_or_create_demo_dataset(n_rows: int = 2000, dataset_path: Path | str | None = None) -> pd.DataFrame:
+    """Create a demo dataset or load a real UNSW-NB15 dataset when one is available."""
+    path = Path(dataset_path) if dataset_path is not None else find_real_dataset_path() or DATASET_PATH
+
+    if path.exists() and path.name.lower().endswith((".csv", ".txt")):
+        df = pd.read_csv(path)
+        return _normalize_feature_names(df)
 
     rng = np.random.default_rng(42)
     proto_choices = ["tcp", "udp", "icmp", "arp"]
@@ -58,20 +103,47 @@ def load_or_create_demo_dataset(n_rows: int = 2000) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(records)
-    DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(DATASET_PATH, index=False)
-    return df
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    return _normalize_feature_names(df)
 
 
 def prepare_training_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     """Clean the dataset and create a model-ready feature table."""
     data = df.copy()
 
-    if "label" in data.columns:
-        label_mapping = {"normal": 0, "attack": 1, "NORMAL": 0, "ATTACK": 1}
-        data["label"] = data["label"].map(label_mapping).fillna(1).astype(int)
-    else:
+    if "label" not in data.columns:
         raise ValueError("The dataset must include a label column before training.")
+
+    label_mapping = {
+        "normal": 0,
+        "attack": 1,
+        "0": 0,
+        "1": 1,
+        "0.0": 0,
+        "1.0": 1,
+        "abnormal": 1,
+        "benign": 0,
+        "anomaly": 1,
+        "dos": 1,
+        "exploits": 1,
+        "fuzzers": 1,
+        "generic": 1,
+        "reconnaissance": 1,
+        "analysis": 1,
+        "backdoor": 1,
+        "shellcode": 1,
+        "worms": 1,
+        "normal.0": 0,
+        "attack.0": 1,
+    }
+    data["label"] = data["label"].astype(str).str.strip().str.lower().map(label_mapping)
+    if data["label"].isna().any():
+        data["label"] = data["label"].fillna(1)
+    data["label"] = data["label"].astype(int)
+
+    if "attack_cat" in data.columns:
+        data = data.drop(columns=["attack_cat"])
 
     for column in data.columns:
         if column == "label":
@@ -85,8 +157,10 @@ def prepare_training_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
             data[column] = data[column].fillna("unknown").astype(str)
 
     X = data.drop(columns=["label"]).copy()
+
+    high_cardinality_columns = {"srcip", "dstip", "sport", "dsport"}
     categorical_columns = [
-        column for column in X.columns if not pd.api.types.is_numeric_dtype(X[column])
+        col for col in X.columns if not pd.api.types.is_numeric_dtype(X[col]) and col not in high_cardinality_columns
     ]
     X = pd.get_dummies(X, columns=categorical_columns, drop_first=True)
     y = data["label"].astype(int)
