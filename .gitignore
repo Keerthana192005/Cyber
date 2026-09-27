@@ -7,3 +7,4 @@ venv/
 .streamlit/
 *.log
 data/*.csv
+data/*.parquet

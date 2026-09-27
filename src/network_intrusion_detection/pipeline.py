@@ -9,12 +9,18 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
 
-DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "demo_network_traffic.csv"
-UNSW_DATASET_CANDIDATES = [
-    Path(__file__).resolve().parents[2] / "data" / "UNSW_NB15_training-set.csv",
-    Path(__file__).resolve().parents[2] / "data" / "UNSW_NB15.csv",
-    Path(__file__).resolve().parents[2] / "UNSW_NB15_training-set.csv",
-    Path(__file__).resolve().parents[2] / "UNSW_NB15.csv",
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+UNSW_TRAIN_DATASET_CANDIDATES = [
+    PROJECT_ROOT / "data" / "UNSW_NB15_training-set.csv",
+    PROJECT_ROOT / "data" / "UNSW_NB15_training-set.parquet",
+    PROJECT_ROOT / "UNSW_NB15_training-set.csv",
+    PROJECT_ROOT / "UNSW_NB15_training-set.parquet",
+]
+UNSW_TEST_DATASET_CANDIDATES = [
+    PROJECT_ROOT / "data" / "UNSW_NB15_testing-set.csv",
+    PROJECT_ROOT / "data" / "UNSW_NB15_testing-set.parquet",
+    PROJECT_ROOT / "UNSW_NB15_testing-set.csv",
+    PROJECT_ROOT / "UNSW_NB15_testing-set.parquet",
 ]
 
 
@@ -46,21 +52,48 @@ def _normalize_feature_names(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def find_real_dataset_path() -> Path | None:
-    """Return a real UNSW-NB15 dataset path if it exists in the project directory."""
-    for candidate in UNSW_DATASET_CANDIDATES:
+def find_real_dataset_path(split: str = "train") -> Path | None:
+    """Find the requested local UNSW-NB15 training or testing split."""
+    if split not in {"train", "test"}:
+        raise ValueError("split must be either 'train' or 'test'.")
+
+    candidates = UNSW_TRAIN_DATASET_CANDIDATES if split == "train" else UNSW_TEST_DATASET_CANDIDATES
+    for candidate in candidates:
         if candidate.exists():
             return candidate
     return None
 
 
+def read_traffic_dataset(dataset_path: Path | str) -> pd.DataFrame:
+    """Read a CSV or Parquet traffic dataset and normalize its label column."""
+    path = Path(dataset_path)
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        df = pd.read_parquet(path)
+    elif path.suffix.lower() in {".csv", ".txt"}:
+        df = pd.read_csv(path)
+    else:
+        raise ValueError(f"Unsupported dataset format: {path.suffix}")
+    return _normalize_feature_names(df)
+
+
+def convert_parquet_to_csv(parquet_path: Path | str, csv_path: Path | str | None = None) -> Path:
+    """Convert one Parquet dataset to CSV, preserving its columns and row order."""
+    source_path = Path(parquet_path)
+    if source_path.suffix.lower() not in {".parquet", ".pq"}:
+        raise ValueError("The source dataset must be a Parquet file.")
+    destination_path = Path(csv_path) if csv_path is not None else source_path.with_suffix(".csv")
+    pd.read_parquet(source_path).to_csv(destination_path, index=False)
+    return destination_path
+
+
 def load_or_create_demo_dataset(n_rows: int = 2000, dataset_path: Path | str | None = None) -> pd.DataFrame:
-    """Create a demo dataset or load a real UNSW-NB15 dataset when one is available."""
+    """Load a real UNSW-NB15 training split or create reproducible demo traffic."""
     path = Path(dataset_path) if dataset_path is not None else find_real_dataset_path()
 
-    if path is not None and path.exists() and path.name.lower().endswith((".csv", ".txt")):
-        df = pd.read_csv(path)
-        return _normalize_feature_names(df)
+    if path is not None:
+        if not path.exists():
+            raise FileNotFoundError(f"Dataset file not found: {path}")
+        return read_traffic_dataset(path)
 
     rng = np.random.default_rng(42)
     proto_choices = ["tcp", "udp", "icmp", "arp"]
@@ -177,7 +210,7 @@ def prepare_attack_category_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Ser
     categories = df["attack_cat"].fillna("").astype(str).str.strip()
     attack_mask = ~categories.str.lower().isin({"", "-", "normal", "none", "nan"})
     attack_rows = df.loc[attack_mask].copy()
-    y = categories.loc[attack_mask].str.title().reset_index(drop=True)
+    y = categories.loc[attack_mask].reset_index(drop=True)
     X = prepare_feature_data(
         attack_rows,
         excluded_columns={"label", "attack_cat"},
@@ -204,12 +237,13 @@ def apply_detection_rules(record: pd.Series | dict) -> list[str]:
 
 
 def build_model() -> RandomForestClassifier:
-    """Create a simple random-forest classifier for traffic classification."""
+    """Create a bounded random-forest classifier for traffic classification."""
     return RandomForestClassifier(
-        n_estimators=200,
-        max_depth=None,
+        n_estimators=100,
+        max_depth=20,
         min_samples_leaf=2,
         random_state=42,
+        n_jobs=-1,
     )
 
 

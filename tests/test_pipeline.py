@@ -9,6 +9,8 @@ if str(ROOT / "src") not in sys.path:
 
 from network_intrusion_detection.pipeline import (
     apply_detection_rules,
+    convert_parquet_to_csv,
+    find_real_dataset_path,
     load_or_create_demo_dataset,
     prepare_attack_category_data,
     prepare_training_data,
@@ -16,7 +18,10 @@ from network_intrusion_detection.pipeline import (
 )
 
 
-def test_load_or_create_demo_dataset_returns_expected_columns():
+def test_load_or_create_demo_dataset_returns_expected_columns(monkeypatch):
+    from network_intrusion_detection import pipeline
+
+    monkeypatch.setattr(pipeline, "UNSW_TRAIN_DATASET_CANDIDATES", [])
     df = load_or_create_demo_dataset(n_rows=50)
 
     assert isinstance(df, pd.DataFrame)
@@ -24,18 +29,54 @@ def test_load_or_create_demo_dataset_returns_expected_columns():
     assert len(df) == 50
 
 
-def test_demo_dataset_honors_requested_size_even_if_old_cache_exists(tmp_path, monkeypatch):
+def test_demo_generator_honors_requested_size_without_real_data(monkeypatch):
     from network_intrusion_detection import pipeline
 
-    monkeypatch.setattr(pipeline, "DATASET_PATH", tmp_path / "old-small-demo.csv")
-    pipeline.DATASET_PATH.write_text("dur,label\n0.1,normal\n", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "UNSW_TRAIN_DATASET_CANDIDATES", [])
 
     df = pipeline.load_or_create_demo_dataset(n_rows=2000)
 
     assert len(df) == 2000
 
 
-def test_prepare_training_data_returns_features_and_labels():
+def test_parquet_dataset_can_be_loaded_and_converted(tmp_path):
+    parquet_path = tmp_path / "UNSW_NB15_training-set.parquet"
+    expected = pd.DataFrame(
+        {
+            "proto": ["tcp", "udp"],
+            "dur": [0.2, 1.4],
+            "attack_cat": ["Normal", "DoS"],
+            "label": [0, 1],
+        }
+    )
+    expected.to_parquet(parquet_path, index=False)
+
+    loaded = load_or_create_demo_dataset(dataset_path=parquet_path)
+    csv_path = convert_parquet_to_csv(parquet_path)
+
+    pd.testing.assert_frame_equal(loaded, expected.assign(label=expected["label"].astype(str)))
+    assert csv_path.exists()
+    assert len(pd.read_csv(csv_path)) == 2
+
+
+def test_real_dataset_discovery_prefers_training_split(tmp_path, monkeypatch):
+    from network_intrusion_detection import pipeline
+
+    train_path = tmp_path / "UNSW_NB15_training-set.csv"
+    test_path = tmp_path / "UNSW_NB15_testing-set.csv"
+    train_path.touch()
+    test_path.touch()
+    monkeypatch.setattr(pipeline, "UNSW_TRAIN_DATASET_CANDIDATES", [train_path])
+    monkeypatch.setattr(pipeline, "UNSW_TEST_DATASET_CANDIDATES", [test_path])
+
+    assert find_real_dataset_path() == train_path
+    assert find_real_dataset_path(split="test") == test_path
+
+
+def test_prepare_training_data_returns_features_and_labels(monkeypatch):
+    from network_intrusion_detection import pipeline
+
+    monkeypatch.setattr(pipeline, "UNSW_TRAIN_DATASET_CANDIDATES", [])
     df = load_or_create_demo_dataset(n_rows=120)
     X, y = prepare_training_data(df)
 
@@ -44,7 +85,10 @@ def test_prepare_training_data_returns_features_and_labels():
     assert len(X) == len(y)
 
 
-def test_train_model_accepts_preprocessed_features():
+def test_train_model_accepts_preprocessed_features(monkeypatch):
+    from network_intrusion_detection import pipeline
+
+    monkeypatch.setattr(pipeline, "UNSW_TRAIN_DATASET_CANDIDATES", [])
     df = load_or_create_demo_dataset(n_rows=200)
     X, y = prepare_training_data(df)
 
@@ -95,7 +139,7 @@ def test_attack_category_data_excludes_normal_rows():
     X, y = prepare_attack_category_data(df)
 
     assert len(X) == len(y) == 3
-    assert set(y) == {"Dos", "Exploits", "Reconnaissance"}
+    assert set(y) == {"DoS", "Exploits", "Reconnaissance"}
     assert all(pd.api.types.is_numeric_dtype(dtype) for dtype in X.dtypes)
 
 
