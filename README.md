@@ -36,6 +36,18 @@ These values form the traffic fingerprint. A model can learn from examples of no
 - Streamlit
 - Matplotlib
 
+## Dashboard capabilities
+
+- Upload a labeled CSV to train and evaluate on a held-out split, or upload an unlabeled CSV to score its traffic records.
+- Review accuracy, precision, recall, F1 score, and the confusion matrix.
+- Inspect global feature importance and the features present in an individual flagged record.
+- Apply readable packet-count, byte-volume, and traffic-rate threshold rules.
+- Predict an attack category when the training CSV includes enough labeled `attack_cat` examples.
+
+The dashboard accepts common UNSW-NB15 fields, including `Label`, `attack_cat`, `proto`, `service`, `state`, `dur`, packet/byte counts, and ports. Source/destination IP addresses are excluded from model features to avoid high-cardinality identifiers.
+
+The bundled dataset is generated demo data, not UNSW-NB15. Rule thresholds are illustrative heuristics and model feature importance is not a causal explanation. For credible evaluation, provide the real dataset and report metrics from its held-out records.
+
 ## Directory structure
 
 - `src/network_intrusion_detection/pipeline.py` – dataset loader, preprocessing, and model functions
@@ -56,4 +68,4 @@ streamlit run app.py
 
 ## Notes
 
-This repository uses a generated demo dataset to keep the project runnable without downloading the large UNSW-NB15 file. It is designed as a clean starter for learning and demonstration.
+The app automatically uses a local UNSW-NB15 CSV if it finds one under `data/` or in the project root. Otherwise, it generates reproducible demo traffic in memory. Dataset CSV files are excluded from Git by `.gitignore`.

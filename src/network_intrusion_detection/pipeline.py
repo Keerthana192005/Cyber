@@ -56,9 +56,9 @@ def find_real_dataset_path() -> Path | None:
 
 def load_or_create_demo_dataset(n_rows: int = 2000, dataset_path: Path | str | None = None) -> pd.DataFrame:
     """Create a demo dataset or load a real UNSW-NB15 dataset when one is available."""
-    path = Path(dataset_path) if dataset_path is not None else find_real_dataset_path() or DATASET_PATH
+    path = Path(dataset_path) if dataset_path is not None else find_real_dataset_path()
 
-    if path.exists() and path.name.lower().endswith((".csv", ".txt")):
+    if path is not None and path.exists() and path.name.lower().endswith((".csv", ".txt")):
         df = pd.read_csv(path)
         return _normalize_feature_names(df)
 
@@ -102,10 +102,7 @@ def load_or_create_demo_dataset(n_rows: int = 2000, dataset_path: Path | str | N
             }
         )
 
-    df = pd.DataFrame(records)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-    return _normalize_feature_names(df)
+    return _normalize_feature_names(pd.DataFrame(records))
 
 
 def prepare_training_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
@@ -142,30 +139,68 @@ def prepare_training_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         data["label"] = data["label"].fillna(1)
     data["label"] = data["label"].astype(int)
 
-    if "attack_cat" in data.columns:
-        data = data.drop(columns=["attack_cat"])
-
-    for column in data.columns:
-        if column == "label":
-            continue
-
-        if pd.api.types.is_numeric_dtype(data[column]):
-            data[column] = pd.to_numeric(data[column], errors="coerce")
-            median_value = data[column].median()
-            data[column] = data[column].fillna(median_value)
-        else:
-            data[column] = data[column].fillna("unknown").astype(str)
-
-    X = data.drop(columns=["label"]).copy()
-
-    high_cardinality_columns = {"srcip", "dstip", "sport", "dsport"}
-    categorical_columns = [
-        col for col in X.columns if not pd.api.types.is_numeric_dtype(X[col]) and col not in high_cardinality_columns
-    ]
-    X = pd.get_dummies(X, columns=categorical_columns, drop_first=True)
+    X = prepare_feature_data(data, excluded_columns={"label", "attack_cat"})
     y = data["label"].astype(int)
 
     return X, y
+
+
+def prepare_feature_data(
+    df: pd.DataFrame, excluded_columns: set[str] | None = None
+) -> pd.DataFrame:
+    """Convert traffic records into numeric model features."""
+    excluded = set(excluded_columns or ()) | {"srcip", "dstip", "id"}
+    X = df.drop(columns=[column for column in excluded if column in df.columns]).copy()
+
+    for column in ("sport", "dsport"):
+        if column in X.columns:
+            X[column] = pd.to_numeric(X[column], errors="coerce")
+
+    for column in X.columns:
+        if pd.api.types.is_numeric_dtype(X[column]):
+            X[column] = pd.to_numeric(X[column], errors="coerce")
+            median_value = X[column].median()
+            X[column] = X[column].fillna(0 if pd.isna(median_value) else median_value)
+        else:
+            X[column] = X[column].fillna("unknown").astype(str)
+
+    categorical_columns = [column for column in X.columns if not pd.api.types.is_numeric_dtype(X[column])]
+    X = pd.get_dummies(X, columns=categorical_columns, drop_first=True, dtype=int)
+    return X
+
+
+def prepare_attack_category_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """Return numeric features and attack-category labels for attack records."""
+    if "attack_cat" not in df.columns:
+        raise ValueError("The dataset does not contain an attack_cat column.")
+
+    categories = df["attack_cat"].fillna("").astype(str).str.strip()
+    attack_mask = ~categories.str.lower().isin({"", "-", "normal", "none", "nan"})
+    attack_rows = df.loc[attack_mask].copy()
+    y = categories.loc[attack_mask].str.title().reset_index(drop=True)
+    X = prepare_feature_data(
+        attack_rows,
+        excluded_columns={"label", "attack_cat"},
+    ).reset_index(drop=True)
+    return X, y
+
+
+def apply_detection_rules(record: pd.Series | dict) -> list[str]:
+    """Return human-readable reasons when simple traffic thresholds are exceeded."""
+    values = record if isinstance(record, dict) else record.to_dict()
+    rules = (
+        ("spkts", 350, "Source packet count is unusually high (spkts > 350)."),
+        ("dpkts", 400, "Destination packet count is unusually high (dpkts > 400)."),
+        ("sbytes", 30000, "Source byte volume is unusually high (sbytes > 30,000)."),
+        ("dbytes", 40000, "Destination byte volume is unusually high (dbytes > 40,000)."),
+        ("rate", 300, "Traffic rate is unusually high (rate > 300)."),
+    )
+    triggered = []
+    for column, threshold, message in rules:
+        value = pd.to_numeric(values.get(column), errors="coerce")
+        if pd.notna(value) and value > threshold:
+            triggered.append(message)
+    return triggered
 
 
 def build_model() -> RandomForestClassifier:

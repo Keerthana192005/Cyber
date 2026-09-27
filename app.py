@@ -1,68 +1,214 @@
 from __future__ import annotations
 
-from pathlib import Path
+from io import BytesIO
 
+import pandas as pd
 import streamlit as st
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
 
-from src.network_intrusion_detection.pipeline import find_real_dataset_path, load_or_create_demo_dataset, prepare_training_data, train_model
+from src.network_intrusion_detection.pipeline import (
+    apply_detection_rules,
+    find_real_dataset_path,
+    load_or_create_demo_dataset,
+    prepare_attack_category_data,
+    prepare_feature_data,
+    prepare_training_data,
+    train_model,
+)
 
 
 st.set_page_config(page_title="Network Security Analyzer", page_icon="🛡️", layout="wide")
 
+
+@st.cache_resource(show_spinner="Training traffic model...")
+def cached_train_model(features: pd.DataFrame, labels: pd.Series):
+    return train_model(features, labels)
+
+
+@st.cache_resource(show_spinner="Training attack-category model...")
+def cached_category_model(features: pd.DataFrame, labels: pd.Series):
+    return train_model(features, labels)
+
+
 st.title("🛡️ Network Security Analyzer")
-st.caption("A simple machine-learning demo for detecting suspicious network traffic.")
+st.caption("Traffic triage, model evaluation, and explainable rule alerts")
 
 real_dataset = find_real_dataset_path()
-if real_dataset is not None:
-    st.info(f"Using real dataset: {real_dataset.name}")
-else:
-    st.info("No local UNSW-NB15 CSV detected. Using the built-in demo data generator.")
+default_df = load_or_create_demo_dataset(n_rows=2000, dataset_path=real_dataset)
 
-raw_df = load_or_create_demo_dataset(n_rows=2000, dataset_path=real_dataset)
-X, y = prepare_training_data(raw_df)
-model = train_model(X, y)
+with st.sidebar:
+    st.header("Data source")
+    if real_dataset is None:
+        st.caption("Using generated demo traffic. Add an UNSW-NB15 CSV under data/ or upload one below.")
+    else:
+        st.caption(f"Detected local dataset: {real_dataset.name}")
+    uploaded_file = st.file_uploader("Upload a CSV", type=["csv"])
+    st.caption("Labeled CSVs are used for training and evaluation. Unlabeled CSVs are scored using the selected dataset model.")
+
+if uploaded_file is not None:
+    raw_df = pd.read_csv(BytesIO(uploaded_file.getvalue()))
+    raw_df.columns = raw_df.columns.astype(str).str.strip()
+    if "Label" in raw_df.columns and "label" not in raw_df.columns:
+        raw_df = raw_df.rename(columns={"Label": "label"})
+    if "Attack_cat" in raw_df.columns and "attack_cat" not in raw_df.columns:
+        raw_df = raw_df.rename(columns={"Attack_cat": "attack_cat"})
+    dataset_name = uploaded_file.name
+    has_labels = "label" in raw_df.columns
+    if not has_labels:
+        st.info("Uploaded CSV has no label column. The built-in dataset is used for training; uploaded rows are scored below.")
+        scoring_df = raw_df.copy()
+        raw_df = default_df
+else:
+    raw_df = default_df
+    scoring_df = raw_df
+    dataset_name = real_dataset.name if real_dataset is not None else "Generated demo data"
+    has_labels = True
+
+if "label" not in raw_df.columns:
+    st.error("The training CSV must include a label or Label column.")
+    st.stop()
+
+try:
+    X, y = prepare_training_data(raw_df)
+except (KeyError, ValueError) as error:
+    st.error(f"Could not prepare this dataset: {error}")
+    st.stop()
+
+if len(y.unique()) < 2 or len(y) < 10:
+    st.error("Training and evaluation need at least 10 rows and both normal and attack labels.")
+    st.stop()
+
+try:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.25,
+        random_state=42,
+        stratify=y if y.value_counts().min() >= 2 else None,
+    )
+except ValueError as error:
+    st.error(f"Could not create a train/test split: {error}")
+    st.stop()
+
+model = cached_train_model(X_train, y_train)
+y_pred = model.predict(X_test)
+metrics = {
+    "Accuracy": accuracy_score(y_test, y_pred),
+    "Precision": precision_score(y_test, y_pred, zero_division=0),
+    "Recall": recall_score(y_test, y_pred, zero_division=0),
+    "F1 score": f1_score(y_test, y_pred, zero_division=0),
+}
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("Total Records", len(raw_df))
+    st.metric("Traffic Records", len(raw_df))
 with col2:
-    st.metric("Normal Traffic", int((y == 0).sum()))
+    st.metric("Normal", int((y == 0).sum()))
 with col3:
-    st.metric("Suspicious Traffic", int((y == 1).sum()))
+    st.metric("Attacks", int((y == 1).sum()))
 
-st.subheader("Traffic overview")
+st.caption(f"Dataset: {dataset_name} · Holdout evaluation: {len(y_test):,} rows")
 
-protocol_counts = raw_df["proto"].value_counts().head(10)
-state_counts = raw_df["state"].value_counts().head(10)
+overview_tab, evaluation_tab, inspect_tab = st.tabs(["Traffic overview", "Model evaluation", "Inspect traffic"])
 
-left_col, right_col = st.columns(2)
-with left_col:
-    st.bar_chart(protocol_counts)
-with right_col:
-    st.bar_chart(state_counts)
+with overview_tab:
+    left_col, right_col = st.columns(2)
+    with left_col:
+        if "proto" in raw_df.columns:
+            st.subheader("Protocols")
+            st.bar_chart(raw_df["proto"].fillna("unknown").value_counts().head(12))
+        else:
+            st.info("No proto column was found in this CSV.")
+    with right_col:
+        if "state" in raw_df.columns:
+            st.subheader("Connection states")
+            st.bar_chart(raw_df["state"].fillna("unknown").value_counts().head(12))
+        else:
+            st.info("No state column was found in this CSV.")
 
-st.subheader("Predictive result")
+    if "attack_cat" in raw_df.columns:
+        categories = raw_df["attack_cat"].fillna("Unknown").astype(str).str.strip()
+        categories = categories[categories.str.lower().isin({"", "-", "normal", "none", "nan"}) == False]
+        if not categories.empty:
+            st.subheader("Attack categories in dataset")
+            st.bar_chart(categories.value_counts().head(12))
 
-sample = raw_df.sample(1).copy()
-feature_columns = X.columns
-sample_X, _ = prepare_training_data(sample)
-sample_X = sample_X.reindex(columns=feature_columns, fill_value=0)
+with evaluation_tab:
+    st.subheader("Held-out performance")
+    metric_columns = st.columns(4)
+    for column, (name, value) in zip(metric_columns, metrics.items()):
+        column.metric(name, f"{value:.1%}")
 
-prediction = model.predict(sample_X)[0]
-confidence = model.predict_proba(sample_X)[0].max()
+    st.subheader("Confusion matrix")
+    matrix = confusion_matrix(y_test, y_pred, labels=[0, 1])
+    st.dataframe(
+        pd.DataFrame(matrix, index=["Actual normal", "Actual attack"], columns=["Predicted normal", "Predicted attack"]),
+        use_container_width=True,
+    )
 
-status = "SUSPICIOUS" if prediction == 1 else "NORMAL"
-color = "#ff4b4b" if prediction == 1 else "#00c853"
+    st.subheader("Most influential model features")
+    importance = pd.Series(model.feature_importances_, index=X_train.columns).sort_values(ascending=False).head(15)
+    st.bar_chart(importance)
+    st.caption("Feature importance is a global model summary, not proof that a feature caused a particular alert.")
 
-st.markdown(
-    f"<div style='padding: 1rem; border-radius: 0.75rem; background: {color}; color: white; font-size: 2rem; text-align: center;'>"
-    f"{status} · confidence: {confidence:.2%}"
-    f"</div>",
-    unsafe_allow_html=True,
-)
+with inspect_tab:
+    st.subheader("Score a traffic record")
+    if scoring_df.empty:
+        st.warning("There are no uploaded records to score.")
+        st.stop()
+    row_index = st.number_input("Row number", min_value=0, max_value=len(scoring_df) - 1, value=0, step=1)
+    sample = scoring_df.iloc[[int(row_index)]].copy()
+    sample_features = prepare_feature_data(sample, excluded_columns={"label", "attack_cat"})
+    sample_features = sample_features.reindex(columns=X_train.columns, fill_value=0)
+    prediction = int(model.predict(sample_features)[0])
+    confidence = float(model.predict_proba(sample_features)[0].max())
 
-st.write(sample)
+    if prediction == 1:
+        st.error(f"ATTACK INDICATED · model confidence {confidence:.1%}")
+    else:
+        st.success(f"NORMAL INDICATED · model confidence {confidence:.1%}")
 
-st.subheader("What the model uses")
+    st.write("**Rule-based signals**")
+    rule_reasons = apply_detection_rules(sample.iloc[0])
+    if rule_reasons:
+        for reason in rule_reasons:
+            st.warning(reason)
+    else:
+        st.write("No configured packet, byte-volume, or traffic-rate threshold was exceeded.")
 
-st.write("The model learns from traffic features such as connection duration, protocol, packet counts, and bytes transferred to decide whether a session looks normal or suspicious.")
+    st.write("**Why the model flagged this row**")
+    active_features = sample_features.iloc[0]
+    feature_importance = pd.Series(model.feature_importances_, index=X_train.columns)
+    active = feature_importance[active_features > 0].sort_values(ascending=False).head(5)
+    if prediction == 1 and not active.empty:
+        explanations = pd.DataFrame(
+            {
+                "Feature": active.index,
+                "Row value": active_features[active.index].values,
+                "Global importance": active.values,
+            }
+        )
+        st.dataframe(explanations, hide_index=True, use_container_width=True)
+        st.caption("These are influential features present in the row; they are indicators, not causal explanations.")
+    elif prediction == 1:
+        st.write("The model combined the encoded traffic features to indicate an attack; no single active feature stood out.")
+    else:
+        st.write("The model did not find a strong attack pattern in this row's features.")
+
+    if prediction == 1 and "attack_cat" in raw_df.columns:
+        try:
+            category_X, category_y = prepare_attack_category_data(raw_df)
+            if category_y.nunique() >= 2 and len(category_y) >= 10:
+                category_model = cached_category_model(category_X, category_y)
+                category_sample = prepare_feature_data(sample, excluded_columns={"label", "attack_cat"})
+                category_sample = category_sample.reindex(columns=category_X.columns, fill_value=0)
+                category_prediction = category_model.predict(category_sample)[0]
+                st.info(f"Likely attack category: **{category_prediction}**")
+            else:
+                st.info("Attack categories are present, but there are not enough labeled attack examples across multiple categories to train this classifier.")
+        except ValueError as error:
+            st.info(f"Attack-category prediction is unavailable: {error}")
+
+    st.write("**Traffic record**")
+    st.dataframe(sample, hide_index=True, use_container_width=True)
